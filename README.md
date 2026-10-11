@@ -1,4 +1,38 @@
-This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
+# RecruitmentTracker
+
+Aplicativo React Native CLI para Android e iOS. A arquitetura proposta para a plataforma completa (web, mobile e API), as decisões de autenticação e as fases de implementação estão em [docs/architecture.md](docs/architecture.md).
+
+O modelo alvo de dados PostgreSQL está em `prisma/schema.prisma`. As migrations executáveis estão em `apps/api/migrations`. O administrador inicial é configurado por `INITIAL_ADMIN_EMAIL`; use `apps/api/.env.example` como base da configuração local.
+
+## API inicial
+
+A API Node.js + PostgreSQL em [apps/api](apps/api/README.md) fornece login Google, usuários/papéis, vagas, etapas, candidatos, candidaturas, movimentações, aprovações, encerramentos, atividades e métricas de resumo. A API e o banco local já foram iniciados e migrados nesta máquina.
+
+## Aplicativo web
+
+O painel React está em `apps/web` e usa a mesma API e banco. Inclui dashboard, vagas, pipeline Kanban, movimentação, notas/timeline, fila de aprovações, configuração de etapas e painel de usuários para o administrador. Copie `apps/web/.env.example` para `apps/web/.env.local`, defina `VITE_GOOGLE_CLIENT_ID` e inicie com `npm run web`. Para login funcionar, configure o mesmo client ID em `GOOGLE_CLIENT_IDS` na API e em `WEB_ORIGIN` com `http://localhost:5173`.
+
+## Inicialização local
+
+```sh
+npm install
+cp apps/api/.env.example apps/api/.env
+cp apps/web/.env.example apps/web/.env.local
+npm run db:up
+npm run db:migrate
+npm run api
+npm run web
+```
+
+Preencha os IDs OAuth e o `INITIAL_ADMIN_EMAIL` em `apps/api/.env` e `VITE_GOOGLE_CLIENT_ID` em `apps/web/.env.local` antes do login. O app mobile usa o mesmo backend. O e-mail de bootstrap não foi informado, então a conta de administrador ainda precisa ser escolhida na configuração local.
+
+## Login Google no mobile
+
+Defina `GOOGLE_WEB_CLIENT_ID` e `GOOGLE_IOS_CLIENT_ID` em `src/config.ts`. Cadastre os clientes OAuth Android (package `com.recruitmenttracker` e SHA-1 do certificado debug/release) e iOS no Google Cloud. No iOS, adicione o URL scheme reverso do cliente iOS em `ios/RecruitmentTracker/Info.plist` e rode `bundle exec pod install`. A API deve aceitar os client IDs web/iOS usados para emitir os tokens em `GOOGLE_CLIENT_IDS`. Use `API_BASE_URL` com o endereço LAN do computador em dispositivos físicos; o valor padrão cobre simuladores/emuladores locais.
+
+## Aplicativo mobile
+
+Este projeto usa [`@react-native-community/cli`](https://github.com/react-native-community/cli).
 
 # Getting Started
 

@@ -38,6 +38,9 @@ local.properties
 # node.js
 #
 node_modules/
+apps/web/dist/
+apps/web/.env.local
+apps/api/.env
 npm-debug.log
 yarn-error.log
 

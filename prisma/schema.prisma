@@ -1,0 +1,267 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  ADMIN
+  HIRING_MANAGER
+  RECRUITER
+  APPROVER
+}
+
+enum VacancyStatus {
+  DRAFT
+  OPEN
+  PAUSED
+  CLOSED
+  CANCELLED
+}
+
+enum ApplicationStatus {
+  ACTIVE
+  HIRED
+  REJECTED
+  WITHDRAWN
+}
+
+enum ApprovalDecision {
+  PENDING
+  APPROVED
+  REJECTED
+  NEEDS_INFORMATION
+}
+
+enum ClosureKind {
+  REJECTION
+  WITHDRAWAL
+}
+
+model User {
+  id               String   @id @default(cuid())
+  googleSubject    String   @unique
+  email            String   @unique
+  name             String
+  role             UserRole @default(RECRUITER)
+  active           Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  managedVacancies Vacancy[] @relation("HiringManager")
+  ownedVacancies   Vacancy[] @relation("Recruiter")
+  transitions      StageTransition[]
+  approvals        ApprovalRecord[]
+  stageAssignments StageApprover[]
+  notes            CandidateNote[]
+  auditEvents      AuditLog[]
+
+  @@index([role, active])
+}
+
+model Department {
+  id        String    @id @default(cuid())
+  name      String    @unique
+  vacancies Vacancy[]
+  createdAt DateTime  @default(now())
+}
+
+model Vacancy {
+  id                String        @id @default(cuid())
+  code              String        @unique
+  title             String
+  description       String        @db.Text
+  requirements      String        @db.Text
+  departmentId      String?
+  department        Department?   @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  hiringManagerId   String
+  hiringManager     User          @relation("HiringManager", fields: [hiringManagerId], references: [id])
+  recruiterId       String
+  recruiter         User          @relation("Recruiter", fields: [recruiterId], references: [id])
+  openings          Int           @default(1)
+  city              String?
+  state             String?
+  country           String        @default("Brasil")
+  workModel         String?
+  employmentType    String?
+  priority          Int           @default(3)
+  status            VacancyStatus @default(DRAFT)
+  openedAt          DateTime?
+  targetCloseAt     DateTime?
+  closedAt          DateTime?
+  closureReason     String?
+  applications      Application[]
+  stages            RecruitmentStage[]
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  @@index([status, targetCloseAt])
+  @@index([departmentId, status])
+  @@index([hiringManagerId, status])
+}
+
+model Candidate {
+  id               String        @id @default(cuid())
+  fullName         String
+  email            String
+  phone            String?
+  resumeUrl        String?
+  professionalUrl  String?
+  city             String?
+  state            String?
+  country          String?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+  applications     Application[]
+
+  @@index([email])
+  @@index([fullName])
+}
+
+model Application {
+  id                 String            @id @default(cuid())
+  candidateId        String
+  candidate          Candidate         @relation(fields: [candidateId], references: [id], onDelete: Restrict)
+  vacancyId          String
+  vacancy            Vacancy           @relation(fields: [vacancyId], references: [id], onDelete: Restrict)
+  currentStageId     String?
+  currentStage       RecruitmentStage? @relation("CurrentStage", fields: [currentStageId], references: [id], onDelete: SetNull)
+  status             ApplicationStatus @default(ACTIVE)
+  appliedAt          DateTime          @default(now())
+  lastMovedAt        DateTime          @default(now())
+  closedAt           DateTime?
+  closureKind        ClosureKind?
+  closureReasonId    String?
+  closureReason      ClosureReason?    @relation(fields: [closureReasonId], references: [id], onDelete: SetNull)
+  salaryExpectation  Decimal?          @db.Decimal(12, 2)
+  transitions        StageTransition[]
+  approvals          ApprovalRecord[]
+  notes              CandidateNote[]
+  activities         CandidateActivity[]
+
+  @@unique([candidateId, vacancyId])
+  @@index([vacancyId, status, currentStageId])
+  @@index([status, lastMovedAt])
+}
+
+model RecruitmentStage {
+  id                    String             @id @default(cuid())
+  vacancyId             String
+  vacancy               Vacancy            @relation(fields: [vacancyId], references: [id], onDelete: Cascade)
+  name                  String
+  description           String?            @db.Text
+  position              Int
+  dueDays               Int?
+  requiresApproval      Boolean            @default(false)
+  approvalMode          String?
+  allowManualTransition Boolean            @default(true)
+  active                Boolean            @default(true)
+  applications          Application[]      @relation("CurrentStage")
+  entries               StageTransition[]  @relation("EnteredStage")
+  exits                 StageTransition[]  @relation("ExitedStage")
+  approvers             StageApprover[]
+  createdAt             DateTime           @default(now())
+  updatedAt             DateTime           @updatedAt
+
+  @@unique([vacancyId, position])
+  @@index([vacancyId, active, position])
+}
+
+model StageApprover {
+  stageId   String
+  stage     RecruitmentStage @relation(fields: [stageId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Restrict)
+  required  Boolean          @default(true)
+
+  @@id([stageId, userId])
+}
+
+model StageTransition {
+  id             String            @id @default(cuid())
+  applicationId  String
+  application    Application       @relation(fields: [applicationId], references: [id], onDelete: Restrict)
+  fromStageId    String?
+  fromStage      RecruitmentStage? @relation("ExitedStage", fields: [fromStageId], references: [id], onDelete: SetNull)
+  toStageId      String?
+  toStage        RecruitmentStage? @relation("EnteredStage", fields: [toStageId], references: [id], onDelete: SetNull)
+  actorId        String
+  actor          User              @relation(fields: [actorId], references: [id], onDelete: Restrict)
+  enteredAt      DateTime          @default(now())
+  exitedAt       DateTime?
+  reason         String?           @db.Text
+  createdAt      DateTime          @default(now())
+
+  @@index([applicationId, enteredAt])
+  @@index([toStageId, enteredAt])
+}
+
+model ApprovalRecord {
+  id            String           @id @default(cuid())
+  applicationId String
+  application   Application      @relation(fields: [applicationId], references: [id], onDelete: Restrict)
+  stageId       String
+  stage         RecruitmentStage @relation(fields: [stageId], references: [id], onDelete: Restrict)
+  approverId    String
+  approver      User             @relation(fields: [approverId], references: [id], onDelete: Restrict)
+  decision      ApprovalDecision @default(PENDING)
+  comment       String?          @db.Text
+  dueAt         DateTime?
+  decidedAt     DateTime?
+  createdAt     DateTime         @default(now())
+
+  @@index([approverId, decision, dueAt])
+  @@index([applicationId, stageId, createdAt])
+}
+
+model ClosureReason {
+  id             String         @id @default(cuid())
+  kind           ClosureKind
+  label          String
+  requiresNote   Boolean        @default(false)
+  active         Boolean        @default(true)
+  applications   Application[]
+
+  @@unique([kind, label])
+}
+
+model CandidateNote {
+  id            String      @id @default(cuid())
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Restrict)
+  authorId      String
+  author        User        @relation(fields: [authorId], references: [id], onDelete: Restrict)
+  body          String      @db.Text
+  confidential  Boolean     @default(false)
+  createdAt     DateTime    @default(now())
+
+  @@index([applicationId, createdAt])
+}
+
+model CandidateActivity {
+  id            String      @id @default(cuid())
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Restrict)
+  title         String
+  dueAt         DateTime?
+  completedAt   DateTime?
+  createdAt     DateTime    @default(now())
+
+  @@index([applicationId, dueAt])
+}
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  actorId     String?
+  actor       User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  action      String
+  entityType  String
+  entityId    String
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  @@index([entityType, entityId, createdAt])
+  @@index([actorId, createdAt])
+}

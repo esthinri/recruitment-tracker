@@ -1,0 +1,15 @@
+{
+  "name": "@recruitment-tracker/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.11.0" },
+  "scripts": {
+    "start": "node --env-file=.env src/server.mjs",
+    "start:dev": "node --watch --env-file=.env src/server.mjs",
+    "migrate": "node --env-file=.env scripts/migrate.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.16.3"
+  }
+}
