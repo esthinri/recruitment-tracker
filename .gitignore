@@ -2,6 +2,22 @@
 #
 .DS_Store
 
+# Environment files and local secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+apps/web/.env.local
+apps/api/.env
+
+# Dependencies and generated web artifacts
+node_modules/
+apps/web/dist/
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
 # Xcode
 #
 build/
@@ -26,6 +42,9 @@ DerivedData
 #
 build/
 .idea
+.vscode/*
+!.vscode/extensions.json
+.fleet
 .gradle
 local.properties
 *.iml
@@ -68,6 +87,13 @@ yarn-error.log
 
 # testing
 /coverage
+/test-results/
+/playwright-report/
+
+# Docker local overrides and volumes
+docker-compose.override.yml
+*.pid
+*.log
 
 # Yarn
 .yarn/*

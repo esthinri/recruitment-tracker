@@ -1,0 +1,14 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+node_modules
+**/node_modules
+apps/web/dist
+android/.gradle
+android/app/build
+ios/Pods
+ios/build
+coverage
+*.log

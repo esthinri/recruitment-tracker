@@ -184,7 +184,7 @@ async function authenticate(request) {
   if (!claims.sub || claims.exp <= Math.floor(Date.now() / 1000))
     throw Object.assign(new Error('Session expired.'), { status: 401 });
   const { rows } = await pool.query(
-    'SELECT id, email, name, role, active FROM users WHERE id = $1',
+    'SELECT id, email, name, role, active, supervisor_id, default_recruiter_id FROM users WHERE id = $1',
     [claims.sub],
   );
   if (!rows[0]?.active)
@@ -201,8 +201,9 @@ async function ensureVacancyAccess(user, vacancyId, client = pool) {
   if (user.role === 'ADMIN') return;
   const { rows } = await client.query(
     `SELECT 1 FROM vacancies v WHERE v.id = $1 AND (v.hiring_manager_id = $2 OR v.recruiter_id = $2
+      OR ($3='HIRING_MANAGER' AND v.hiring_manager_id = $4)
       OR EXISTS (SELECT 1 FROM stage_approvers sa JOIN recruitment_stages s ON s.id = sa.stage_id WHERE s.vacancy_id = v.id AND sa.user_id = $2))`,
-    [vacancyId, user.id],
+    [vacancyId, user.id, user.role, user.supervisor_id],
   );
   if (!rows.length)
     throw Object.assign(new Error('Vacancy not found or access denied.'), {
@@ -285,6 +286,25 @@ async function handle(request, response) {
     return send(response, 200, { token: signSession(rows[0]), user: rows[0] });
   }
 
+  if (request.method === 'POST' && url.pathname === '/auth/demo') {
+    if (process.env.ENABLE_DEMO_AUTH !== 'true' || process.env.NODE_ENV !== 'development')
+      throw Object.assign(new Error('Demo login is disabled.'), { status: 404 });
+    const body = await readJson(request);
+    const demoUsers = {
+      manager: 'demo-manager',
+      recruiter: 'demo-recruiter',
+      approver: 'demo-approver',
+    };
+    const id = demoUsers[body.role];
+    if (!id) throw Object.assign(new Error('Unknown demo role.'), { status: 400 });
+    const { rows } = await pool.query(
+      'SELECT id,email,name,role,active FROM users WHERE id=$1 AND active=true',
+      [id],
+    );
+    if (!rows[0]) throw Object.assign(new Error('Seed demo data first.'), { status: 409 });
+    return send(response, 200, { token: signSession(rows[0]), user: rows[0] });
+  }
+
   const user = await authenticate(request);
   if (request.method === 'GET' && url.pathname === '/auth/me')
     return send(response, 200, { user });
@@ -292,7 +312,7 @@ async function handle(request, response) {
   if (request.method === 'GET' && url.pathname === '/users') {
     requireRole(user, ['ADMIN']);
     const { rows } = await pool.query(
-      'SELECT id, email, name, role, active, created_at FROM users ORDER BY name LIMIT 500',
+      'SELECT id, email, name, role, active, supervisor_id, default_recruiter_id, created_at FROM users ORDER BY name LIMIT 500',
     );
     return send(response, 200, { items: rows });
   }
@@ -355,6 +375,35 @@ async function handle(request, response) {
     return send(response, 200, { user: rows[0] });
   }
 
+  const userRelationshipsPath = url.pathname.match(/^\/users\/([\w-]+)\/relationships$/);
+  if (request.method === 'PATCH' && userRelationshipsPath) {
+    requireRole(user, ['ADMIN']);
+    const body = await readJson(request);
+    const targetId = userRelationshipsPath[1];
+    const supervisorId = body.supervisorId || null;
+    const recruiterId = body.defaultRecruiterId || null;
+    if (targetId === supervisorId)
+      throw Object.assign(new Error('A gestor cannot be their own supervisor.'), { status: 400 });
+    const { rows: targetRows } = await pool.query('SELECT id,role FROM users WHERE id=$1 AND active=true',[targetId]);
+    if (!targetRows[0] || targetRows[0].role !== 'HIRING_MANAGER')
+      throw Object.assign(new Error('Relationships can only be configured for active hiring managers.'), { status: 400 });
+    const { rows: links } = await pool.query('SELECT id,role,active FROM users WHERE id=ANY($1::text[])',[[supervisorId,recruiterId].filter(Boolean)]);
+    if (supervisorId && !links.some(link=>link.id===supervisorId&&link.role==='HIRING_MANAGER'&&link.active))
+      throw Object.assign(new Error('Supervisor must be an active hiring manager.'), { status: 400 });
+    if (recruiterId && !links.some(link=>link.id===recruiterId&&link.role==='RECRUITER'&&link.active))
+      throw Object.assign(new Error('Assigned recruiter must be active and have recruiter role.'), { status: 400 });
+    if (supervisorId) {
+      const { rows: cycle } = await pool.query('SELECT 1 FROM users WHERE id=$1 AND supervisor_id=$2',[supervisorId,targetId]);
+      if (cycle.length) throw Object.assign(new Error('This supervisor assignment would create a reporting cycle.'), { status: 400 });
+    }
+    const { rows } = await pool.query(
+      'UPDATE users SET supervisor_id=$1,default_recruiter_id=$2 WHERE id=$3 RETURNING id,supervisor_id,default_recruiter_id',
+      [supervisorId,recruiterId,targetId],
+    );
+    await audit(pool,user.id,'user.relationships_changed','user',targetId,{supervisorId,recruiterId});
+    return send(response,200,{user:rows[0]});
+  }
+
   if (request.method === 'POST' && url.pathname === '/departments') {
     requireRole(user, ['ADMIN']);
     const body = await readJson(request);
@@ -382,12 +431,124 @@ async function handle(request, response) {
     return send(response, 201, { item: rows[0] });
   }
 
+  if (request.method === 'GET' && url.pathname === '/vacancy-requests') {
+    const values=[];
+    let scope='';
+    if(user.role==='HIRING_MANAGER'){
+      values.push([user.id,user.supervisor_id].filter(Boolean));
+      scope='WHERE r.hiring_manager_id=ANY($1::text[]) OR r.created_by=ANY($1::text[])';
+    } else if(user.role==='RECRUITER'){
+      values.push(user.id);scope='WHERE r.recruiter_id=$1';
+    } else if(user.role!=='ADMIN'){
+      scope='WHERE false';
+    }
+    const {rows}=await pool.query(
+      `SELECT r.id,r.title,r.opening_type,r.description,r.technical_requirements,r.seniority_level,r.status,r.review_note,r.created_at,r.reviewed_at,r.result_vacancy_id,
+        hm.id AS hiring_manager_id,hm.name AS hiring_manager,cr.name AS requester,rec.id AS recruiter_id,rec.name AS recruiter
+       FROM vacancy_requests r JOIN users hm ON hm.id=r.hiring_manager_id JOIN users cr ON cr.id=r.created_by JOIN users rec ON rec.id=r.recruiter_id
+       ${scope} ORDER BY CASE r.status WHEN 'PENDING_RECRUITER' THEN 0 WHEN 'RETURNED' THEN 1 ELSE 2 END,r.created_at DESC LIMIT 300`,values,
+    );
+    return send(response,200,{items:rows});
+  }
+
+  if(request.method==='POST'&&url.pathname==='/vacancy-requests'){
+    requireRole(user,['ADMIN','HIRING_MANAGER']);
+    const body=await readJson(request);
+    const title=typeof body.title==='string'?body.title.trim():'';
+    const openingType=body.openingType;
+    const description=typeof body.description==='string'?body.description.trim():'';
+    const technicalRequirements=typeof body.technicalRequirements==='string'?body.technicalRequirements.trim():'';
+    const seniorityLevel=typeof body.seniorityLevel==='string'?body.seniorityLevel.trim():'';
+    if(!title||title.length>200||!['NEW_POSITION','REPLACEMENT'].includes(openingType)||!description||description.length>10000||!technicalRequirements||technicalRequirements.length>10000||!seniorityLevel||seniorityLevel.length>80)
+      throw Object.assign(new Error('Cargo, tipo de abertura, descrição, requisitos técnicos e nível são obrigatórios.'),{status:400});
+    const managerId=user.role==='ADMIN'?body.hiringManagerId:user.id;
+    const {rows:managers}=await pool.query('SELECT id,role,active,default_recruiter_id FROM users WHERE id=$1',[managerId]);
+    const manager=managers[0];
+    if(!manager?.active||manager.role!=='HIRING_MANAGER')
+      throw Object.assign(new Error('Selecione um gestor ativo para esta abertura.'),{status:400});
+    const recruiterId=user.role==='ADMIN'?(body.recruiterId||manager.default_recruiter_id):manager.default_recruiter_id;
+    const {rows:recruiters}=await pool.query("SELECT id FROM users WHERE id=$1 AND role='RECRUITER' AND active=true",[recruiterId]);
+    if(!recruiters[0])
+      throw Object.assign(new Error('Vincule um recrutador ativo ao gestor antes de solicitar uma abertura.'),{status:400});
+    const {rows}=await pool.query(
+      `INSERT INTO vacancy_requests (created_by,hiring_manager_id,recruiter_id,title,opening_type,description,technical_requirements,seniority_level)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [user.id,managerId,recruiterId,title,openingType,description,technicalRequirements,seniorityLevel],
+    );
+    await audit(pool,user.id,'vacancy_request.created','vacancy_request',rows[0].id,{title,openingType,recruiterId});
+    return send(response,201,{item:rows[0]});
+  }
+
+  const requestResubmitPath=url.pathname.match(/^\/vacancy-requests\/([\w-]+)\/resubmit$/);
+  if(request.method==='PATCH'&&requestResubmitPath){
+    requireRole(user,['ADMIN','HIRING_MANAGER']);
+    const body=await readJson(request);
+    const title=typeof body.title==='string'?body.title.trim():'';
+    const openingType=body.openingType;
+    const description=typeof body.description==='string'?body.description.trim():'';
+    const technicalRequirements=typeof body.technicalRequirements==='string'?body.technicalRequirements.trim():'';
+    const seniorityLevel=typeof body.seniorityLevel==='string'?body.seniorityLevel.trim():'';
+    if(!title||!['NEW_POSITION','REPLACEMENT'].includes(openingType)||!description||!technicalRequirements||!seniorityLevel)
+      throw Object.assign(new Error('Todos os campos da solicitação são obrigatórios.'),{status:400});
+    const {rows}=await pool.query(
+      `UPDATE vacancy_requests SET title=$1,opening_type=$2,description=$3,technical_requirements=$4,seniority_level=$5,status='PENDING_RECRUITER',review_note=NULL,reviewer_id=NULL,reviewed_at=NULL
+       WHERE id=$6 AND status='RETURNED' AND (created_by=$7 OR hiring_manager_id=$7 OR $8='ADMIN') RETURNING *`,
+      [title,openingType,description,technicalRequirements,seniorityLevel,requestResubmitPath[1],user.id,user.role],
+    );
+    if(!rows[0])throw Object.assign(new Error('Solicitação devolvida não encontrada ou sem acesso.'),{status:404});
+    await audit(pool,user.id,'vacancy_request.resubmitted','vacancy_request',rows[0].id,{title});
+    return send(response,200,{item:rows[0]});
+  }
+
+  const requestReviewPath=url.pathname.match(/^\/vacancy-requests\/([\w-]+)\/review$/);
+  if(request.method==='POST'&&requestReviewPath){
+    requireRole(user,['RECRUITER']);
+    const body=await readJson(request);
+    if(!['APPROVE','RETURN'].includes(body.decision)||(body.decision==='RETURN'&&!String(body.comment||'').trim()))
+      throw Object.assign(new Error('Escolha aprovar ou devolver com observações.'),{status:400});
+    const client=await pool.connect();
+    try{
+      await client.query('BEGIN');
+      const {rows:requests}=await client.query('SELECT * FROM vacancy_requests WHERE id=$1 FOR UPDATE',[requestReviewPath[1]]);
+      const opening=requests[0];
+      if(!opening||opening.recruiter_id!==user.id||opening.status!=='PENDING_RECRUITER')
+        throw Object.assign(new Error('Solicitação pendente não encontrada para este recrutador.'),{status:404});
+      let vacancyId=null;
+      if(body.decision==='APPROVE'){
+        const code=`RT-${new Date().getFullYear()}-${randomBytes(3).toString('hex').toUpperCase()}`;
+        const {rows:vacanciesCreated}=await client.query(
+          `INSERT INTO vacancies (code,title,description,requirements,hiring_manager_id,recruiter_id,openings,country,status,opened_at,opening_type,seniority_level)
+           VALUES ($1,$2,$3,$4,$5,$6,1,'Brasil','OPEN',now(),$7,$8) RETURNING id`,
+          [code,opening.title,opening.description,opening.technical_requirements,opening.hiring_manager_id,opening.recruiter_id,opening.opening_type,opening.seniority_level],
+        );
+        vacancyId=vacanciesCreated[0].id;
+        const defaultStages=['Triagem de currículo','Entrevista com recrutamento','Entrevista técnica','Entrevista com gestor','Entrevista final','Proposta','Contratado'];
+        for(let position=0;position<defaultStages.length;position++)
+          await client.query('INSERT INTO recruitment_stages (vacancy_id,name,position) VALUES ($1,$2,$3)',[vacancyId,defaultStages[position],position]);
+      }
+      const {rows}=await client.query(
+        `UPDATE vacancy_requests SET status=$1,review_note=$2,reviewer_id=$3,reviewed_at=now(),result_vacancy_id=$4 WHERE id=$5 RETURNING id,status,review_note,result_vacancy_id,reviewed_at`,
+        [body.decision==='APPROVE'?'APPROVED':'RETURNED',body.decision==='RETURN'?String(body.comment).trim():null,user.id,vacancyId,opening.id],
+      );
+      await audit(client,user.id,body.decision==='APPROVE'?'vacancy_request.approved':'vacancy_request.returned','vacancy_request',opening.id,{comment:body.decision==='RETURN'?String(body.comment).trim():null,vacancyId});
+      await client.query('COMMIT');
+      return send(response,200,{item:rows[0]});
+    }catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
+  }
+
   if (request.method === 'GET' && url.pathname === '/vacancies') {
     const values = [];
     let scope = '';
-    if (user.role !== 'ADMIN') {
+    if (user.role === 'HIRING_MANAGER') {
       values.push(user.id);
-      scope = `AND (v.hiring_manager_id = $1 OR v.recruiter_id = $1)`;
+      values.push(user.supervisor_id || '');
+      scope = `AND (v.hiring_manager_id = $1 OR v.hiring_manager_id = $2)`;
+    } else if (user.role === 'RECRUITER') {
+      values.push(user.id);
+      scope = `AND v.recruiter_id = $1`;
+    } else if (user.role === 'APPROVER') {
+      values.push(user.id);
+      scope = `AND EXISTS (SELECT 1 FROM stage_approvers sa JOIN recruitment_stages rs ON rs.id=sa.stage_id WHERE rs.vacancy_id=v.id AND sa.user_id=$1)`;
     }
     if (url.searchParams.has('status')) {
       const status = url.searchParams.get('status');
@@ -401,7 +562,7 @@ async function handle(request, response) {
     const { rows } = await pool.query(
       `SELECT v.id, v.code, v.title, v.status, v.priority, v.opened_at, v.target_close_at,
               v.city, v.state, v.country, v.work_model, v.openings,
-              d.name AS department, hm.name AS hiring_manager, rec.name AS recruiter
+              v.opening_type,v.seniority_level,d.name AS department, hm.name AS hiring_manager, rec.name AS recruiter
        FROM vacancies v LEFT JOIN departments d ON d.id = v.department_id
        JOIN users hm ON hm.id = v.hiring_manager_id JOIN users rec ON rec.id = v.recruiter_id
        WHERE true ${scope} ORDER BY v.updated_at DESC LIMIT 100`,
@@ -411,119 +572,7 @@ async function handle(request, response) {
   }
 
   if (request.method === 'POST' && url.pathname === '/vacancies') {
-    requireRole(user, ['ADMIN', 'HIRING_MANAGER']);
-    const body = await readJson(request);
-    const title = typeof body.title === 'string' ? body.title.trim() : '';
-    const description =
-      typeof body.description === 'string' ? body.description.trim() : '';
-    const requirements =
-      typeof body.requirements === 'string' ? body.requirements.trim() : '';
-    const openings = Number(body.openings ?? 1);
-    const code =
-      typeof body.code === 'string' && body.code.trim()
-        ? body.code.trim().toUpperCase()
-        : `V-${randomBytes(4).toString('hex').toUpperCase()}`;
-    if (
-      !title ||
-      !description ||
-      !requirements ||
-      !Number.isInteger(openings) ||
-      openings < 1 ||
-      openings > 1000
-    ) {
-      throw Object.assign(
-        new Error(
-          'title, description, requirements and a valid openings count are required.',
-        ),
-        { status: 400 },
-      );
-    }
-    const recruiterId =
-      typeof body.recruiterId === 'string' ? body.recruiterId : user.id;
-    const managerId =
-      user.role === 'ADMIN' && typeof body.hiringManagerId === 'string'
-        ? body.hiringManagerId
-        : user.id;
-    const targetCloseAt = body.targetCloseAt
-      ? new Date(body.targetCloseAt)
-      : null;
-    if (targetCloseAt && Number.isNaN(targetCloseAt.getTime()))
-      throw Object.assign(new Error('targetCloseAt must be a valid date.'), {
-        status: 400,
-      });
-    const { rows: assignments } = await pool.query(
-      'SELECT id, role, active FROM users WHERE id = ANY($1::text[])',
-      [[managerId, recruiterId]],
-    );
-    const manager = assignments.find(person => person.id === managerId);
-    const recruiter = assignments.find(person => person.id === recruiterId);
-    if (
-      !manager?.active ||
-      !['ADMIN', 'HIRING_MANAGER'].includes(manager.role) ||
-      !recruiter?.active ||
-      !['ADMIN', 'HIRING_MANAGER', 'RECRUITER'].includes(recruiter.role)
-    ) {
-      throw Object.assign(
-        new Error(
-          'The assigned manager or recruiter is inactive or has an incompatible role.',
-        ),
-        { status: 400 },
-      );
-    }
-    const { rows } = await pool.query(
-      `INSERT INTO vacancies (code, title, description, requirements, department_id, hiring_manager_id, recruiter_id,
-         openings, city, state, country, work_model, employment_type, priority, status, opened_at, target_close_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
-       RETURNING id, code, title, description, requirements, hiring_manager_id, recruiter_id,
-         openings, city, state, country, work_model, employment_type, priority, status, opened_at, target_close_at, created_at`,
-      [
-        code,
-        title,
-        description,
-        requirements,
-        body.departmentId || null,
-        managerId,
-        recruiterId,
-        openings,
-        body.city || null,
-        body.state || null,
-        body.country || 'Brasil',
-        body.workModel || null,
-        body.employmentType || null,
-        Number.isInteger(body.priority)
-          ? Math.min(5, Math.max(1, body.priority))
-          : 3,
-        'OPEN',
-        new Date(),
-        targetCloseAt,
-      ],
-    );
-    const defaultStages = [
-      'Triagem de currículo',
-      'Entrevista com recrutamento',
-      'Entrevista técnica',
-      'Entrevista com gestor',
-      'Entrevista final',
-      'Proposta',
-      'Contratado',
-    ];
-    for (let position = 0; position < defaultStages.length; position++) {
-      await pool.query(
-        'INSERT INTO recruitment_stages (vacancy_id,name,position) VALUES ($1,$2,$3)',
-        [rows[0].id, defaultStages[position], position],
-      );
-    }
-    await pool.query(
-      'INSERT INTO audit_logs (actor_id, action, entity_type, entity_id, metadata) VALUES ($1,$2,$3,$4,$5)',
-      [
-        user.id,
-        'vacancy.created',
-        'vacancy',
-        rows[0].id,
-        JSON.stringify({ code, title }),
-      ],
-    );
-    return send(response, 201, { item: rows[0] });
+    throw Object.assign(new Error('Solicite a abertura em /vacancy-requests. A vaga é criada após aprovação do recrutador.'), { status: 409 });
   }
 
   const vacancyPath = url.pathname.match(/^\/vacancies\/([\w-]+)$/);
@@ -1004,7 +1053,7 @@ async function handle(request, response) {
     const { rows } = await pool.query(
       `SELECT a.id,a.vacancy_id,a.status,a.applied_at,a.last_moved_at,a.current_stage_id,
         s.name AS stage_name,s.position AS stage_position,s.due_days,
-        c.id AS candidate_id,c.full_name,c.email,c.phone,c.resume_url,c.professional_url,c.city,c.state,c.country,
+        c.id AS candidate_id,c.full_name,c.email,c.phone,c.resume_url,c.professional_url,c.city,c.state,c.country,a.salary_expectation,
         u.name AS recruiter,
         EXTRACT(EPOCH FROM (now()-a.last_moved_at))/86400 AS days_in_stage,
         (SELECT count(*) FROM candidate_notes n WHERE n.application_id=a.id) AS note_count,
@@ -1029,6 +1078,36 @@ async function handle(request, response) {
       [user.id],
     );
     return send(response, 200, { items: rows });
+  }
+
+  if (request.method === 'GET' && url.pathname === '/notifications') {
+    await pool.query(
+      `INSERT INTO notifications (user_id,type,message,entity_type,entity_id,due_at,dedupe_key)
+       SELECT ar.approver_id,'APPROVAL',
+         'Aprovação pendente: ' || c.full_name || ' · ' || v.title,
+         'approval',ar.id,ar.due_at,'approval:' || ar.id
+       FROM approval_records ar JOIN applications a ON a.id=ar.application_id
+       JOIN candidates c ON c.id=a.candidate_id JOIN vacancies v ON v.id=a.vacancy_id
+       WHERE ar.approver_id=$1 AND ar.decision IN ('PENDING','NEEDS_INFORMATION')
+       ON CONFLICT (dedupe_key) DO NOTHING`,
+      [user.id],
+    );
+    const { rows } = await pool.query(
+      `SELECT id,type,message,entity_type,entity_id,due_at,read_at,created_at
+       FROM notifications WHERE user_id=$1 ORDER BY (read_at IS NULL) DESC,created_at DESC LIMIT 50`,
+      [user.id],
+    );
+    return send(response, 200, { items: rows });
+  }
+
+  const notificationPath = url.pathname.match(/^\/notifications\/([\w-]+)\/read$/);
+  if (request.method === 'PATCH' && notificationPath) {
+    const { rows } = await pool.query(
+      'UPDATE notifications SET read_at=COALESCE(read_at,now()) WHERE id=$1 AND user_id=$2 RETURNING id,read_at',
+      [notificationPath[1], user.id],
+    );
+    if (!rows[0]) throw Object.assign(new Error('Notification not found.'), { status: 404 });
+    return send(response, 200, { item: rows[0] });
   }
 
   const approvalPath = url.pathname.match(/^\/approvals\/([\w-]+)\/decision$/);
@@ -1524,7 +1603,13 @@ async function handle(request, response) {
     }
     if (user.role !== 'ADMIN') {
       values.push(user.id);
-      scope += ` AND (v.hiring_manager_id=$${values.length} OR v.recruiter_id=$${values.length} OR EXISTS (SELECT 1 FROM stage_approvers sa JOIN recruitment_stages s ON s.id=sa.stage_id WHERE s.vacancy_id=v.id AND sa.user_id=$${values.length}))`;
+      const userParam = values.length;
+      scope += ` AND (v.hiring_manager_id=$${userParam} OR v.recruiter_id=$${userParam} OR EXISTS (SELECT 1 FROM stage_approvers sa JOIN recruitment_stages s ON s.id=sa.stage_id WHERE s.vacancy_id=v.id AND sa.user_id=$${userParam})`;
+      if (user.supervisor_id) {
+        values.push(user.supervisor_id);
+        scope += ` OR v.hiring_manager_id=$${values.length}`;
+      }
+      scope += ')';
     }
     const { rows } = await pool.query(
       `WITH scoped_vacancies AS (
