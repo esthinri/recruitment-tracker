@@ -6,11 +6,16 @@ import {
   useMemo,
   useState,
 } from 'react';
+import { CBadge, CButton, CCard, CCardBody, CContainer } from '@coreui/react';
+import CIcon from '@coreui/icons-react';
+import { cilBell } from '@coreui/icons';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:4000';
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || '';
+const DEMO_LOGIN = import.meta.env.VITE_ENABLE_DEMO_LOGIN === 'true';
 type User = { id: string; name: string; email: string; role: string };
-type ManagedUser = User & { active: boolean; created_at: string };
+type ManagedUser = User & { active: boolean; created_at: string; supervisor_id?: string | null; default_recruiter_id?: string | null };
+type VacancyRequest = { id: string; title: string; opening_type: 'NEW_POSITION'|'REPLACEMENT'; description: string; technical_requirements: string; seniority_level: string; status: string; review_note?: string|null; hiring_manager?: string; recruiter?: string; result_vacancy_id?: string|null };
 type Vacancy = {
   id: string;
   code: string;
@@ -18,6 +23,9 @@ type Vacancy = {
   status: string;
   priority: number;
   city?: string;
+  state?: string;
+  country?: string;
+  salary_expectation?: string | number | null;
   work_model?: string;
   department?: string;
   target_close_at?: string;
@@ -41,6 +49,9 @@ type Application = {
   email: string;
   resume_url?: string;
   city?: string;
+  state?: string;
+  country?: string;
+  salary_expectation?: string | number | null;
   status: string;
   current_stage_id: string;
   stage_name: string;
@@ -57,6 +68,7 @@ type Approval = {
   candidate_name: string;
   application_id: string;
 };
+type Notification = { id: string; type: string; message: string; read_at?: string | null; created_at: string };
 type Metrics = {
   open_vacancies: number;
   active_applications: number;
@@ -96,10 +108,13 @@ declare global {
 }
 
 export function App() {
+  const [theme, setTheme] = useState<'light' | 'dark'>(() =>
+    localStorage.getItem('recruitment-tracker-theme') === 'dark' ? 'dark' : 'light',
+  );
   const [token, setToken] = useState('');
   const [user, setUser] = useState<User | null>(null);
   const [page, setPage] = useState<
-    'dashboard' | 'vacancies' | 'approvals' | 'users'
+    'dashboard' | 'vacancies' | 'approvals' | 'users' | 'openingRequests'
   >('dashboard');
   const [vacancies, setVacancies] = useState<Vacancy[]>([]);
   const [metrics, setMetrics] = useState<Metrics | null>(null);
@@ -107,17 +122,26 @@ export function App() {
     Array<{ name: string; active_candidates: number }>
   >([]);
   const [approvals, setApprovals] = useState<Approval[]>([]);
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+  const [showNotifications, setShowNotifications] = useState(false);
   const [managedUsers, setManagedUsers] = useState<ManagedUser[]>([]);
+  const [openingRequests, setOpeningRequests] = useState<VacancyRequest[]>([]);
+  const [openingModal, setOpeningModal] = useState(false);
+  const [openingEditing, setOpeningEditing] = useState<VacancyRequest | null>(null);
+  const [draggedId, setDraggedId] = useState('');
   const [timelineApplication, setTimelineApplication] =
     useState<Application | null>(null);
   const [timeline, setTimeline] = useState<TimelineEvent[]>([]);
   const [noteText, setNoteText] = useState('');
   const [selected, setSelected] = useState<Vacancy | null>(null);
+  const [vacancyView, setVacancyView] = useState<'pipeline' | 'statistics'>('pipeline');
   const [stages, setStages] = useState<Stage[]>([]);
   const [applications, setApplications] = useState<Application[]>([]);
+  const [vacancyMetrics, setVacancyMetrics] = useState<Metrics | null>(null);
+  const [vacancyStageCounts, setVacancyStageCounts] = useState<Array<{ id: string; name: string; active_candidates: number }>>([]);
   const [busy, setBusy] = useState(false);
+  const [demoRole, setDemoRole] = useState('manager');
   const [error, setError] = useState('');
-  const [vacancyModal, setVacancyModal] = useState(false);
   const [candidateModal, setCandidateModal] = useState(false);
   const [candidateQuery, setCandidateQuery] = useState('');
   const [stageModal, setStageModal] = useState(false);
@@ -131,6 +155,10 @@ export function App() {
     allowManualTransition: true,
     approverIds: [] as string[],
   });
+
+  useEffect(() => {
+    localStorage.setItem('recruitment-tracker-theme', theme);
+  }, [theme]);
 
   const request = useCallback(
     async <T,>(path: string, init: RequestInit = {}) => {
@@ -154,18 +182,22 @@ export function App() {
     setBusy(true);
     setError('');
     try {
-      const [v, d, a] = await Promise.all([
+      const [v, d, a, n] = await Promise.all([
         request<{ items: Vacancy[] }>('/vacancies'),
         request<{
           metrics: Metrics;
           stages: Array<{ name: string; active_candidates: number }>;
         }>('/dashboard/summary'),
         request<{ items: Approval[] }>('/approvals'),
+        request<{ items: Notification[] }>('/notifications'),
       ]);
       setVacancies(v.items);
       setMetrics(d.metrics);
       setPipeline(d.stages);
       setApprovals(a.items);
+      setNotifications(n.items);
+      const openings = await request<{items: VacancyRequest[]}>('/vacancy-requests');
+      setOpeningRequests(openings.items);
       if (user?.role === 'ADMIN') {
         const result = await request<{ items: ManagedUser[] }>('/users');
         setManagedUsers(result.items);
@@ -176,6 +208,12 @@ export function App() {
       setBusy(false);
     }
   }, [request, token, user]);
+  const markNotificationRead = async (notification: Notification) => {
+    try {
+      await request(`/notifications/${notification.id}/read`, { method: 'PATCH' });
+      setNotifications(items => items.map(item => item.id === notification.id ? { ...item, read_at: new Date().toISOString() } : item));
+    } catch (e) { setError((e as Error).message); }
+  };
   useEffect(() => {
     refresh();
   }, [refresh]);
@@ -227,15 +265,19 @@ export function App() {
 
   const openVacancy = async (v: Vacancy) => {
     setSelected(v);
+    setVacancyView('pipeline');
     setBusy(true);
     setError('');
     try {
-      const [s, a] = await Promise.all([
+      const [s, a, stats] = await Promise.all([
         request<{ items: Stage[] }>(`/vacancies/${v.id}/stages`),
         request<{ items: Application[] }>(`/vacancies/${v.id}/applications`),
+        request<{ metrics: Metrics; stages: Array<{ id: string; name: string; active_candidates: number }> }>(`/dashboard/summary?vacancyId=${encodeURIComponent(v.id)}`),
       ]);
       setStages(s.items.filter(x => x.active));
       setApplications(a.items);
+      setVacancyMetrics(stats.metrics);
+      setVacancyStageCounts(stats.stages);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -370,25 +412,6 @@ export function App() {
     setVacancies([]);
     setMetrics(null);
   };
-  const submitVacancy = async (e: FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    const data = new FormData(e.currentTarget);
-    setBusy(true);
-    setError('');
-    try {
-      const result = await request<{ item: Vacancy }>('/vacancies', {
-        method: 'POST',
-        body: JSON.stringify(Object.fromEntries(data)),
-      });
-      setVacancyModal(false);
-      await refresh();
-      await openVacancy(result.item);
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  };
   const submitCandidate = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     if (!selected) return;
@@ -401,6 +424,7 @@ export function App() {
         body: JSON.stringify({
           vacancyId: selected.id,
           candidate: Object.fromEntries(data),
+          salaryExpectation: data.get('salaryExpectation') ? Number(data.get('salaryExpectation')) : null,
         }),
       });
       setCandidateModal(false);
@@ -419,16 +443,32 @@ export function App() {
       window.alert('Última etapa configurada.');
       return;
     }
+    await moveToStage(app, next.id);
+  };
+  const moveToStage = async (app: Application, toStageId: string) => {
+    if (!canMoveCandidates || toStageId === app.current_stage_id) return;
+    const currentIndex=stages.findIndex(stage=>stage.id===app.current_stage_id);
+    const destinationIndex=stages.findIndex(stage=>stage.id===toStageId);
+    let reason: string | undefined;
+    if(destinationIndex>currentIndex+1){ reason=window.prompt('Justificativa para avançar etapas:')?.trim(); if(!reason)return; }
     try {
       await request(`/applications/${app.id}/move`, {
         method: 'POST',
-        body: JSON.stringify({ toStageId: next.id }),
+        body: JSON.stringify({ toStageId, reason }),
       });
       if (selected) await openVacancy(selected);
     } catch (e) {
       window.alert((e as Error).message);
     }
   };
+  const reviewOpening = async (opening: VacancyRequest, decision: 'APPROVE'|'RETURN') => {
+    const comment=decision==='RETURN'?window.prompt('Observações para o gestor ajustar:')?.trim():undefined;
+    if(decision==='RETURN'&&!comment)return;
+    try { await request(`/vacancy-requests/${opening.id}/review`,{method:'POST',body:JSON.stringify({decision,comment})}); await refresh(); } catch(e){window.alert((e as Error).message);}
+  };
+  const submitOpening = async (e: FormEvent<HTMLFormElement>) => { e.preventDefault(); const data=Object.fromEntries(new FormData(e.currentTarget)); try { await request('/vacancy-requests',{method:'POST',body:JSON.stringify(data)}); setOpeningModal(false); await refresh(); } catch(err){setError((err as Error).message);} };
+  const resubmitOpening = async (e: FormEvent<HTMLFormElement>) => { e.preventDefault(); if(!openingEditing)return; const data=Object.fromEntries(new FormData(e.currentTarget)); try { await request(`/vacancy-requests/${openingEditing.id}/resubmit`,{method:'PATCH',body:JSON.stringify(data)}); setOpeningEditing(null); await refresh(); } catch(err){setError((err as Error).message);} };
+  const saveManagerLinks = async (target: ManagedUser, supervisorId: string, recruiterId: string) => { try { await request(`/users/${target.id}/relationships`,{method:'PATCH',body:JSON.stringify({supervisorId:supervisorId||null,recruiterId:recruiterId||null})}); await refresh(); } catch(e){window.alert((e as Error).message);} };
   const close = async (app: Application) => {
     try {
       const kindChoice = window.prompt(
@@ -509,6 +549,22 @@ export function App() {
       window.alert((e as Error).message);
     }
   };
+  const signInDemo = async () => {
+    try {
+      setBusy(true);
+      setError('');
+      const session = await request<{ token: string; user: User }>('/auth/demo', {
+        method: 'POST',
+        body: JSON.stringify({ role: demoRole }),
+      });
+      setToken(session.token);
+      setUser(session.user);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
   const createDepartment = async () => {
     const name = window.prompt('Nome do departamento:')?.trim();
     if (!name) return;
@@ -523,6 +579,7 @@ export function App() {
     }
   };
   const canManage = ['ADMIN', 'HIRING_MANAGER'].includes(user?.role || '');
+  const canMoveCandidates = ['ADMIN', 'HIRING_MANAGER', 'RECRUITER'].includes(user?.role || '');
   const pageName = useMemo(
     () =>
       ((
@@ -531,6 +588,7 @@ export function App() {
           vacancies: 'Vagas',
           approvals: 'Aprovações',
           users: 'Administração',
+          openingRequests: 'Aberturas de vaga',
         } as const
       )[page]),
     [page],
@@ -538,7 +596,7 @@ export function App() {
 
   if (!user)
     return (
-      <main className="login-page">
+      <main className="login-page" data-coreui-theme={theme}>
         <div className="login-card">
           <div className="brand-mark">R</div>
           <p className="eyebrow">RECRUITMENT TRACKER</p>
@@ -559,6 +617,19 @@ export function App() {
           ) : (
             <div id="google-login" />
           )}
+          {DEMO_LOGIN && (
+            <div className="demo-login">
+              <label htmlFor="demo-role">Demonstração local</label>
+              <div>
+                <select id="demo-role" value={demoRole} onChange={event => setDemoRole(event.target.value)}>
+                  <option value="manager">Gestora</option>
+                  <option value="recruiter">Recrutador</option>
+                  <option value="approver">Aprovadora</option>
+                </select>
+                <button className="secondary" onClick={signInDemo} disabled={busy}>Entrar</button>
+              </div>
+            </div>
+          )}
           <small>
             Acesso somente para usuários autorizados · login via Google
           </small>
@@ -567,7 +638,7 @@ export function App() {
     );
 
   return (
-    <div className="app-shell">
+    <div className="app-shell" data-coreui-theme={theme}>
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-small">R</div>
@@ -582,6 +653,7 @@ export function App() {
               'dashboard',
               'vacancies',
               'approvals',
+              ...(['ADMIN','HIRING_MANAGER','RECRUITER'].includes(user.role) ? ['openingRequests' as const] : []),
               ...(user.role === 'ADMIN' ? ['users' as const] : []),
             ] as const
           ).map(item => (
@@ -600,6 +672,7 @@ export function App() {
                     vacancies: '▦',
                     approvals: '✓',
                     users: '⚙',
+                    openingRequests: '＋',
                   }[item]
                 }
               </span>
@@ -610,6 +683,7 @@ export function App() {
                     vacancies: 'Vagas',
                     approvals: 'Aprovações',
                     users: 'Administração',
+                    openingRequests: 'Aberturas',
                   } as const
                 )[item]
               }
@@ -643,6 +717,20 @@ export function App() {
             <strong>{selected?.title || pageName}</strong>
           </div>
           <div className="top-actions">
+            <CButton color="light" className="theme-toggle" onClick={() => setTheme(current => current === 'light' ? 'dark' : 'light')} aria-label={theme === 'light' ? 'Ativar tema escuro' : 'Ativar tema claro'} title={theme === 'light' ? 'Ativar tema escuro' : 'Ativar tema claro'}>
+              <span aria-hidden="true">{theme === 'light' ? '◐' : '☀'}</span><span className="theme-toggle-label">{theme === 'light' ? 'Escuro' : 'Claro'}</span>
+            </CButton>
+            <div className="notification-wrap">
+              <CButton color="light" className="icon-button notification-button" onClick={() => setShowNotifications(open => !open)} title="Notificações" aria-label="Notificações">
+                <CIcon icon={cilBell} />{notifications.filter(item => !item.read_at).length > 0 && <CBadge color="primary" className="notification-count">{notifications.filter(item => !item.read_at).length}</CBadge>}
+              </CButton>
+              {showNotifications && <div className="notification-popover">
+                <strong>Notificações</strong>
+                {notifications.length === 0 ? <p className="muted">Nenhuma notificação.</p> : notifications.slice(0, 8).map(item => <button key={item.id} className={item.read_at ? 'notification-item read' : 'notification-item'} onClick={() => markNotificationRead(item)}>
+                  <span>{item.message}</span><small>{item.read_at ? 'Lida' : 'Marcar como lida'}</small>
+                </button>)}
+              </div>}
+            </div>
             <span className="role-chip">
               {{
                 ADMIN: 'Administrador',
@@ -651,13 +739,9 @@ export function App() {
                 APPROVER: 'Aprovador',
               }[user.role] || user.role}
             </span>
-            <button
-              className="icon-button"
-              onClick={() => refresh()}
-              title="Atualizar"
-            >
-              ↻
-            </button>
+            <CButton color="light" className="refresh-button" onClick={() => refresh()} title="Atualizar dados">
+              ↻ <span>Atualizar</span>
+            </CButton>
           </div>
         </header>
         {error && (
@@ -668,8 +752,8 @@ export function App() {
         )}
         {busy && <div className="loading-line" />}
         {selected ? (
-          <section className="content">
-            <button className="back-button" onClick={() => setSelected(null)}>
+          <CContainer fluid className="content">
+              <button className="back-button" onClick={() => setSelected(null)}>
               ← Voltar para vagas
             </button>
             <div className="page-heading vacancy-heading">
@@ -697,6 +781,30 @@ export function App() {
                 </button>
               </div>
             </div>
+            <div className="vacancy-tabs" role="tablist" aria-label="Visualizações da vaga">
+              <button role="tab" aria-selected={vacancyView === 'pipeline'} className={vacancyView === 'pipeline' ? 'vacancy-tab active' : 'vacancy-tab'} onClick={() => setVacancyView('pipeline')}>Pipeline</button>
+              <button role="tab" aria-selected={vacancyView === 'statistics'} className={vacancyView === 'statistics' ? 'vacancy-tab active' : 'vacancy-tab'} onClick={() => setVacancyView('statistics')}>Dados e estatísticas</button>
+            </div>
+            {vacancyView === 'statistics' && (
+            <div className="vacancy-insights" aria-label={`Estatísticas da vaga ${selected.title}`}>
+              <div className="vacancy-metric-grid">
+                <Metric title="Candidaturas ativas" value={vacancyMetrics?.active_applications} />
+                <Metric title="Contratações" value={vacancyMetrics?.hires} />
+                <Metric title="Reprovações" value={vacancyMetrics?.rejections} />
+                <Metric title="Desistências" value={vacancyMetrics?.withdrawals} />
+                <Metric title="Aprovações pendentes" value={vacancyMetrics?.pending_approvals} />
+                <Metric title="Etapas atrasadas" value={vacancyMetrics?.overdue_applications} />
+                <Metric title="Tempo médio até contratação" value={vacancyMetrics?.avg_days_to_hire != null ? `${vacancyMetrics.avg_days_to_hire} dias` : '—'} />
+                <Metric title="Conversão em contratação" value={applications.length ? `${Math.round(((vacancyMetrics?.hires || 0) / applications.length) * 100)}%` : '0%'} />
+              </div>
+              <div className="panel vacancy-stage-panel">
+                <div className="panel-title"><h2>Pipeline desta vaga</h2><span>Candidatos ativos por etapa</span></div>
+                {vacancyStageCounts.map(stage => <div className="pipeline-row" key={stage.id}><span>{stage.name}</span><div className="bar-track"><div style={{ width: `${Math.max(4, Math.min(stage.active_candidates * 10, 100))}%` }} /></div><b>{stage.active_candidates}</b></div>)}
+                {!vacancyStageCounts.length && <p className="muted">As etapas aparecerão aqui quando estiverem configuradas.</p>}
+              </div>
+            </div>
+            )}
+            {vacancyView === 'pipeline' && <>
             <div className="kanban-tools">
               <span>
                 {applications.filter(app => app.status === 'ACTIVE').length}{' '}
@@ -711,7 +819,7 @@ export function App() {
             </div>
             <div className="kanban-board">
               {stages.map(stage => (
-                <div className="kanban-lane" key={stage.id}>
+                <div className={`kanban-lane ${draggedId && canMoveCandidates ? 'drop-ready' : ''}`} key={stage.id} onDragOver={e => { if (canMoveCandidates) { e.preventDefault(); e.currentTarget.classList.add('drag-over'); } }} onDragLeave={e => e.currentTarget.classList.remove('drag-over')} onDrop={e => { e.preventDefault(); e.currentTarget.classList.remove('drag-over'); const id=e.dataTransfer.getData('text/application-id'); const app=applications.find(item=>item.id===id); if(app) void moveToStage(app,stage.id); setDraggedId(''); }}>
                   <div className="lane-heading">
                     <strong>{stage.name}</strong>
                     <span>
@@ -741,14 +849,15 @@ export function App() {
                             .includes(candidateQuery.toLowerCase()),
                       )
                       .map(app => (
-                        <article className="candidate-card" key={app.id}>
+                        <article className="candidate-card" key={app.id} draggable={canMoveCandidates} onDragStart={e => { e.dataTransfer.setData('text/application-id',app.id); e.dataTransfer.effectAllowed='move'; setDraggedId(app.id); }} onDragEnd={() => setDraggedId('')}>
                           <div className="candidate-head">
                             <div className="candidate-avatar">
                               {app.full_name.slice(0, 1).toUpperCase()}
                             </div>
                             <div>
                               <strong>{app.full_name}</strong>
-                              <small>{app.city || app.email}</small>
+                              <small>{[app.city,app.state,app.country].filter(Boolean).join(', ') || 'Localização não informada'}</small>
+                              <small>{app.salary_expectation ? `Pretensão: ${Number(app.salary_expectation).toLocaleString('pt-BR',{style:'currency',currency:'BRL',maximumFractionDigits:0})}` : 'Pretensão não informada'}</small>
                             </div>
                           </div>
                           <div className="tag-row">
@@ -818,9 +927,10 @@ export function App() {
                 </div>
               ))}
             </div>
-          </section>
+            </>}
+          </CContainer>
         ) : page === 'dashboard' ? (
-          <section className="content">
+          <CContainer fluid className="content">
             <div className="page-heading">
               <div>
                 <p className="eyebrow">PAINEL EXECUTIVO</p>
@@ -829,9 +939,9 @@ export function App() {
                   Indicadores das vagas dentro do seu escopo de acesso.
                 </p>
               </div>
-              <button className="secondary" onClick={refresh}>
+              <CButton color="light" className="secondary" onClick={refresh}>
                 Atualizar dados ↻
-              </button>
+              </CButton>
             </div>
             <div className="metric-grid">
               <Metric title="Vagas abertas" value={metrics?.open_vacancies} />
@@ -911,16 +1021,16 @@ export function App() {
                         {v.code} · {v.city || 'Brasil'}
                       </small>
                     </div>
-                    <span className="status-pill">
+                    <CBadge color={v.status === 'OPEN' ? 'success' : 'secondary'} className="status-pill">
                       {v.status === 'OPEN' ? 'Aberta' : v.status}
-                    </span>
+                    </CBadge>
                   </button>
                 ))}
               </div>
             </div>
-          </section>
+          </CContainer>
         ) : page === 'vacancies' ? (
-          <section className="content">
+          <CContainer fluid className="content">
             <div className="page-heading">
               <div>
                 <p className="eyebrow">PROCESSOS SELETIVOS</p>
@@ -932,9 +1042,9 @@ export function App() {
               {canManage && (
                 <button
                   className="primary"
-                  onClick={() => setVacancyModal(true)}
+                  onClick={() => setOpeningModal(true)}
                 >
-                  ＋ Nova vaga
+                  ＋ Solicitar abertura
                 </button>
               )}
             </div>
@@ -975,9 +1085,14 @@ export function App() {
                 </p>
               </div>
             )}
-          </section>
+          </CContainer>
+        ) : page === 'openingRequests' ? (
+          <CContainer fluid className="content">
+            <div className="page-heading"><div><p className="eyebrow">SOLICITAÇÕES E ANÁLISE</p><h1>Aberturas de vaga</h1><p className="muted">O recrutador analisa a necessidade antes de criar a vaga no pipeline.</p></div>{['ADMIN','HIRING_MANAGER'].includes(user.role) && <button className="primary" onClick={() => setOpeningModal(true)}>＋ Solicitar abertura</button>}</div>
+            <div className="opening-list">{openingRequests.map(item=><article className="opening-card" key={item.id}><div className="tile-top"><CBadge color={item.status==='APPROVED'?'success':item.status==='RETURNED'?'warning':'primary'}>{item.status==='PENDING_RECRUITER'?'Em análise':item.status==='RETURNED'?'Devolvida': 'Aprovada'}</CBadge><small>{item.hiring_manager} · recrutador: {item.recruiter}</small></div><h2>{item.title}</h2><p><b>{item.opening_type==='NEW_POSITION'?'Nova cadeira':'Reposição'} · {item.seniority_level}</b></p><p>{item.description}</p><p><b>Requisitos técnicos:</b> {item.technical_requirements}</p>{item.review_note&&<p className="review-note"><b>Observações do recrutador:</b> {item.review_note}</p>}{user.role==='RECRUITER'&&item.status==='PENDING_RECRUITER'&&<div className="header-buttons"><button className="approve" onClick={()=>void reviewOpening(item,'APPROVE')}>Aprovar abertura</button><button className="secondary" onClick={()=>void reviewOpening(item,'RETURN')}>Devolver com observações</button></div>}{item.status==='RETURNED'&&['ADMIN','HIRING_MANAGER'].includes(user.role)&&<button className="secondary" onClick={()=>setOpeningEditing(item)}>Ajustar e reenviar</button>}{item.status==='APPROVED'&&item.result_vacancy_id&&<small>Vaga criada e encaminhada para o pipeline.</small>}</article>)}{!openingRequests.length&&<div className="empty-state"><h2>Nenhuma solicitação</h2><p>Solicitações abertas ou atribuídas aparecerão aqui.</p></div>}</div>
+          </CContainer>
         ) : page === 'approvals' ? (
-          <section className="content">
+          <CContainer fluid className="content">
             <div className="page-heading">
               <div>
                 <p className="eyebrow">SUA FILA</p>
@@ -1033,7 +1148,7 @@ export function App() {
                 </div>
               )}
             </div>
-          </section>
+          </CContainer>
         ) : (
           <section className="content">
             <div className="page-heading">
@@ -1044,14 +1159,15 @@ export function App() {
                   Atribua papéis a usuários que já autenticaram com Google.
                 </p>
               </div>
-              <button className="primary" onClick={createDepartment}>
+              <CButton color="primary" className="primary" onClick={createDepartment}>
                 ＋ Departamento
-              </button>
+              </CButton>
             </div>
             <div className="user-table">
               <div className="user-table-head">
                 <span>Usuário</span>
                 <span>Papel</span>
+                <span>Supervisor / recrutador</span>
                 <span>Status</span>
               </div>
               {managedUsers.map(target => (
@@ -1077,6 +1193,7 @@ export function App() {
                     <option value="HIRING_MANAGER">Gestor da vaga</option>
                     <option value="APPROVER">Aprovador</option>
                   </select>
+                  {target.role === 'HIRING_MANAGER' ? <div className="manager-links"><select aria-label={`Supervisor de ${target.name}`} value={target.supervisor_id||''} onChange={event=>void saveManagerLinks(target,event.target.value,target.default_recruiter_id||'')}><option value="">Sem supervisor</option>{managedUsers.filter(x=>x.role==='HIRING_MANAGER'&&x.id!==target.id&&x.active).map(x=><option key={x.id} value={x.id}>{x.name}</option>)}</select><select aria-label={`Recrutador de ${target.name}`} value={target.default_recruiter_id||''} onChange={event=>void saveManagerLinks(target,target.supervisor_id||'',event.target.value)}><option value="">Vincular recrutador…</option>{managedUsers.filter(x=>x.role==='RECRUITER'&&x.active).map(x=><option key={x.id} value={x.id}>{x.name}</option>)}</select></div> : <small>—</small>}
                   <button
                     className={target.active ? 'status-pill' : 'inactive-pill'}
                     onClick={() => toggleUser(target)}
@@ -1096,30 +1213,8 @@ export function App() {
           </section>
         )}
       </main>
-      {vacancyModal && (
-        <Modal title="Criar vaga" close={() => setVacancyModal(false)}>
-          <form onSubmit={submitVacancy}>
-            <Field name="title" label="Título da vaga" required />
-            <Field name="description" label="Descrição" multiline required />
-            <Field name="requirements" label="Requisitos" multiline required />
-            <div className="form-row">
-              <Field name="city" label="Cidade" />
-              <Field name="openings" label="Posições" type="number" value="1" />
-            </div>
-            <label className="field">
-              <span>Modelo de trabalho</span>
-              <select name="workModel">
-                <option>Híbrido</option>
-                <option>Presencial</option>
-                <option>Remoto</option>
-              </select>
-            </label>
-            <button className="primary wide" disabled={busy}>
-              {busy ? 'Salvando…' : 'Criar vaga'}
-            </button>
-          </form>
-        </Modal>
-      )}
+      {openingModal && <Modal title="Solicitar abertura de vaga" close={() => setOpeningModal(false)}><form onSubmit={submitOpening}>{user.role==='ADMIN'&&<><label className="field"><span>Gestor responsável</span><select name="hiringManagerId" required><option value="">Selecione…</option>{managedUsers.filter(x=>x.role==='HIRING_MANAGER'&&x.active).map(x=><option key={x.id} value={x.id}>{x.name}</option>)}</select></label><label className="field"><span>Recrutador (opcional se já vinculado ao gestor)</span><select name="recruiterId"><option value="">Usar vínculo do gestor</option>{managedUsers.filter(x=>x.role==='RECRUITER'&&x.active).map(x=><option key={x.id} value={x.id}>{x.name}</option>)}</select></label></>}<Field name="title" label="Nome do cargo" required/><label className="field"><span>Tipo de abertura</span><select name="openingType" required><option value="NEW_POSITION">Nova cadeira</option><option value="REPLACEMENT">Reposição</option></select></label><Field name="description" label="Descrição da vaga" multiline required/><Field name="technicalRequirements" label="Requisitos técnicos" multiline required/><SenioritySelect/><button className="primary wide">Encaminhar para análise</button></form></Modal>}
+      {openingEditing && <Modal title="Ajustar solicitação devolvida" close={() => setOpeningEditing(null)}><form onSubmit={resubmitOpening}><Field name="title" label="Nome do cargo" defaultValue={openingEditing.title} required/><label className="field"><span>Tipo de abertura</span><select name="openingType" defaultValue={openingEditing.opening_type} required><option value="NEW_POSITION">Nova cadeira</option><option value="REPLACEMENT">Reposição</option></select></label><Field name="description" label="Descrição da vaga" multiline defaultValue={openingEditing.description} required/><Field name="technicalRequirements" label="Requisitos técnicos" multiline defaultValue={openingEditing.technical_requirements} required/><SenioritySelect defaultValue={openingEditing.seniority_level}/><button className="primary wide">Reenviar para análise</button></form></Modal>}
       {candidateModal && (
         <Modal
           title="Adicionar candidato"
@@ -1130,6 +1225,8 @@ export function App() {
             <Field name="email" label="E-mail" type="email" required />
             <Field name="phone" label="Telefone" />
             <Field name="city" label="Cidade" />
+            <div className="form-row"><Field name="state" label="Estado" /><Field name="country" label="País" value="Brasil" /></div>
+            <Field name="salaryExpectation" label="Pretensão salarial (R$ / mês)" type="number" />
             <Field name="resumeUrl" label="Link do currículo" type="url" />
             <button className="primary wide" disabled={busy}>
               {busy ? 'Salvando…' : 'Criar candidatura'}
@@ -1345,12 +1442,48 @@ function Metric({
   value: number | string | undefined | null;
 }) {
   return (
-    <article className="metric-card">
-      <span>{title}</span>
-      <strong>{value ?? '—'}</strong>
-    </article>
+    <CCard className="metric-card">
+      <CCardBody>
+        <span>{title}</span>
+        <strong>{value ?? '—'}</strong>
+      </CCardBody>
+    </CCard>
   );
 }
+
+const SENIORITY_LEVELS = [
+  'Aprendiz',
+  'Estágio',
+  'Auxiliar',
+  'Assistente',
+  'Júnior',
+  'Pleno',
+  'Sênior',
+  'Especialista',
+  'Líder / Tech Lead',
+  'Supervisão',
+  'Coordenação',
+  'Gerência',
+  'Diretoria',
+  'Executivo / C-Level',
+  'Outro',
+];
+
+function SenioritySelect({ defaultValue = '' }: { defaultValue?: string }) {
+  return (
+    <label className="field">
+      <span>Nível da posição</span>
+      <select name="seniorityLevel" defaultValue={defaultValue} required>
+        <option value="" disabled>Selecione um nível</option>
+        {!SENIORITY_LEVELS.includes(defaultValue) && defaultValue && (
+          <option value={defaultValue}>{defaultValue}</option>
+        )}
+        {SENIORITY_LEVELS.map(level => <option key={level} value={level}>{level}</option>)}
+      </select>
+    </label>
+  );
+}
+
 function Field({
   name,
   label,
@@ -1358,6 +1491,7 @@ function Field({
   required = false,
   multiline = false,
   value,
+  defaultValue,
   onChange,
 }: {
   name: string;
@@ -1366,6 +1500,7 @@ function Field({
   required?: boolean;
   multiline?: boolean;
   value?: string;
+  defaultValue?: string;
   onChange?: (
     event: ChangeEvent<HTMLInputElement | HTMLTextAreaElement>,
   ) => void;
@@ -1379,6 +1514,7 @@ function Field({
           required={required}
           rows={3}
           value={onChange ? value : undefined}
+          defaultValue={onChange ? undefined : defaultValue}
           onChange={onChange ? event => onChange(event) : undefined}
         />
       ) : (
@@ -1387,7 +1523,7 @@ function Field({
           type={type}
           required={required}
           value={onChange ? value : undefined}
-          defaultValue={onChange ? undefined : value}
+          defaultValue={onChange ? undefined : (defaultValue ?? value)}
           onChange={onChange ? event => onChange(event) : undefined}
         />
       )}
@@ -1405,10 +1541,10 @@ function Modal({
 }) {
   return (
     <div
-      className="modal-backdrop"
+      className="rt-modal-backdrop"
       onMouseDown={e => e.target === e.currentTarget && close()}
     >
-      <section className="modal">
+      <section className="rt-modal">
         <header>
           <h2>{title}</h2>
           <button className="icon-button" onClick={close}>

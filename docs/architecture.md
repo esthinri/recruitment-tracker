@@ -1,71 +1,315 @@
-# Arquitetura inicial
+# Arquitetura do Recruitment Tracker
 
-## Decisões
+Este documento descreve a arquitetura executável atual e seus principais fluxos. Os diagramas usam Mermaid e podem ser renderizados pelo GitHub e por visualizadores compatíveis.
 
-- Preservar o aplicativo React Native CLI existente para Android e iOS.
-- Organizar web, mobile, API e pacotes compartilhados como workspaces no mesmo repositório.
-- Usar PostgreSQL como fonte de verdade e Prisma para schema e migrations.
-- Implementar a API como monólito modular TypeScript; separar serviços só quando volume ou operação justificar.
-- Autenticar com Google. A API valida o token Google contra os client IDs permitidos; a identidade persistida é o `sub` do Google, não o e-mail isoladamente.
-- A conta definida por `INITIAL_ADMIN_EMAIL` recebe o papel ADMIN no bootstrap. O papel é concedido apenas após validação do token e verificação de e-mail pelo Google. Não há cadastro público de administradores; mudanças de papel exigem ação administrativa auditada.
-- Novos usuários autenticados recebem papel RECRUITER com escopo limitado até que o administrador conceda acessos adicionais. A autorização é aplicada na API em toda operação e considera o escopo da vaga.
-- Sessões da API devem usar cookies HttpOnly/Secure/SameSite no web e credenciais protegidas no mobile. Tokens Google não devem ser armazenados como sessão duradoura.
-- Documentos de candidatura devem ficar em armazenamento privado, servidos por URLs temporárias após autorização.
+## Visão de implantação
 
-## Autenticação e bootstrap do administrador
+O painel web e a API são construídos como imagens Docker separadas. O Nginx serve os arquivos do React e encaminha chamadas `/api/*` para a API. PostgreSQL é a fonte de verdade; o serviço de migração aplica os arquivos SQL antes da API iniciar. O aplicativo React Native roda no dispositivo ou simulador e acessa a mesma API.
 
-1. O cliente autentica pelo Google e envia o token de identidade à API.
-2. A API verifica assinatura, emissor, validade, audiência permitida e `email_verified`.
-3. A API encontra ou cria o usuário pelo `googleSubject` (`sub`).
-4. Se o e-mail verificado corresponde a `INITIAL_ADMIN_EMAIL`, a API atribui ADMIN. Essa verificação também é aplicada no login para permitir bootstrap inicial e impedir dependência de seed manual.
-5. Para outros usuários, o papel padrão é RECRUITER. A autorização impede acesso a vagas fora do escopo concedido.
+```mermaid
+flowchart LR
+  subgraph Clients[Clientes]
+    Browser[Navegador<br/>React + TypeScript + CoreUI]
+    Mobile[Aplicativo móvel<br/>React Native]
+    Google[Google Identity Services]
+  end
 
-O administrador inicial deve usar uma conta corporativa controlada. O endereço é configuração de ambiente, nunca um segredo embutido no app. Mudanças na identidade inicial devem exigir operação controlada e registro de auditoria.
+  subgraph Compose[Docker Compose]
+    Web[Nginx<br/>arquivos web + proxy /api]
+    API[API REST<br/>Node.js + pg]
+    Migrate[Runner de migrations<br/>SQL versionado]
+    DB[(PostgreSQL)]
+    Seed[Seed de demonstração<br/>perfil opcional]
+  end
 
-## Integridade e indicadores
+  Browser -->|página e assets| Web
+  Browser -->|/api/*| Web
+  Web -->|proxy reverso| API
+  Mobile -->|HTTPS em produção / HTTP local| API
+  Browser <-->|login Google| Google
+  Mobile <-->|login nativo| Google
+  API -->|verifica assinatura e claims| Google
+  API <-->|SQL via pg| DB
+  Migrate -->|aplica migrations| DB
+  Seed -->|dados fictícios| DB
+```
 
-Movimentações atualizam a candidatura e fecham/abrem o intervalo da etapa em uma transação. Os registros de `StageTransition` e `AuditLog` são append-only pela aplicação. Reordenar ou desativar etapas não apaga registros históricos; etapas referenciadas não devem ser excluídas fisicamente.
+### Componentes e limites
 
-As métricas devem ser calculadas no servidor, usando intervalos de tempo armazenados e regras documentadas. Funil usa como denominador as candidaturas que alcançaram a etapa anterior; candidaturas ativas, reprovadas, desistentes e contratadas devem ser segmentadas conforme a métrica. Toda visualização deve expor o período e o escopo aplicado.
+| Componente | Responsabilidade atual |
+| --- | --- |
+| `apps/web` | Interface web React/TypeScript, CoreUI, Kanban, dashboard e administração. |
+| `App.tsx` (raiz) | Aplicativo React Native para Android/iOS; cliente REST em `src/api.ts`. |
+| `apps/api/src/server.mjs` | API REST Node.js em monólito modular por domínio/rotas; usa `pg` e PostgreSQL. |
+| `apps/api/migrations` | Schema executável do banco, aplicado em ordem pelo runner. É a fonte de verdade do banco atual. |
+| `apps/web/nginx.conf` | Serve o build web e encaminha `/api/` para a API. |
+| `docker-compose.yml` | Orquestra PostgreSQL, migration, API, web e seed opcional. |
 
-## Módulos da API
+O arquivo `prisma/schema.prisma` descreve um modelo de referência, mas as migrations SQL são o schema efetivamente aplicado hoje. Web e mobile compartilham a API REST e os formatos JSON; os tipos ainda não estão extraídos para um pacote compartilhado. A API está concentrada em um servidor Node.js e pode ser dividida em módulos físicos conforme o código crescer.
 
-- `identity`: login Google, sessão, usuários e papéis.
-- `organization`: departamentos e equipes.
-- `vacancies`: vagas e histórico de alterações.
-- `pipeline`: etapas, regras e transições.
-- `candidates`: cadastros e documentos.
-- `applications`: candidaturas, encerramentos, notas e atividades.
-- `approvals`: filas e decisões.
-- `analytics`: métricas e detalhamento autorizado.
-- `notifications`: alertas e histórico de envio.
-- `audit`: trilha de auditoria e exportações controladas.
+## Modelo relacional
 
-## Estrutura alvo
+`Application` representa a candidatura da pessoa a uma vaga. Dados da pessoa ficam em `candidates`; etapa, situação, salário e encerramento pertencem à candidatura. As transições registram a trilha temporal de cada candidatura.
+
+```mermaid
+erDiagram
+  USERS {
+    text id PK
+    text google_subject UK
+    text email UK
+    text role
+    boolean active
+    text supervisor_id FK
+    text default_recruiter_id FK
+  }
+  DEPARTMENTS {
+    text id PK
+    text name UK
+  }
+  VACANCIES {
+    text id PK
+    text code UK
+    text title
+    text status
+    text hiring_manager_id FK
+    text recruiter_id FK
+    text department_id FK
+    text opening_type
+    text seniority_level
+  }
+  VACANCY_REQUESTS {
+    text id PK
+    text created_by FK
+    text hiring_manager_id FK
+    text recruiter_id FK
+    text opening_type
+    text seniority_level
+    text status
+    text result_vacancy_id FK
+  }
+  CANDIDATES {
+    text id PK
+    text full_name
+    text email
+    text resume_url
+  }
+  RECRUITMENT_STAGES {
+    text id PK
+    text vacancy_id FK
+    text name
+    int position
+    int due_days
+    boolean requires_approval
+  }
+  APPLICATIONS {
+    text id PK
+    text candidate_id FK
+    text vacancy_id FK
+    text current_stage_id FK
+    text status
+    numeric salary_expectation
+    timestamptz applied_at
+    timestamptz last_moved_at
+    timestamptz closed_at
+  }
+  STAGE_APPROVERS {
+    text stage_id PK, FK
+    text user_id PK, FK
+    boolean required
+  }
+  STAGE_TRANSITIONS {
+    bigint id PK
+    text application_id FK
+    text from_stage_id FK
+    text to_stage_id FK
+    text actor_id FK
+    timestamptz entered_at
+    timestamptz exited_at
+    text reason
+  }
+  APPROVAL_RECORDS {
+    text id PK
+    text application_id FK
+    text stage_id FK
+    text approver_id FK
+    text decision
+    timestamptz due_at
+    timestamptz decided_at
+  }
+  CLOSURE_REASONS {
+    text id PK
+    text kind
+    text label
+    boolean requires_note
+  }
+  CANDIDATE_NOTES {
+    text id PK
+    text application_id FK
+    text author_id FK
+    boolean confidential
+  }
+  CANDIDATE_ACTIVITIES {
+    text id PK
+    text application_id FK
+    text title
+    timestamptz due_at
+    timestamptz completed_at
+  }
+  NOTIFICATIONS {
+    text id PK
+    text user_id FK
+    text dedupe_key UK
+    timestamptz read_at
+  }
+  AUDIT_LOGS {
+    bigint id PK
+    text actor_id FK
+    text entity_type
+    text entity_id
+    jsonb metadata
+  }
+
+  USERS o|--o{ USERS : supervises
+  USERS ||--o{ VACANCIES : manages
+  USERS ||--o{ VACANCIES : recruits
+  DEPARTMENTS o|--o{ VACANCIES : groups
+  USERS ||--o{ VACANCY_REQUESTS : creates
+  USERS ||--o{ VACANCY_REQUESTS : manages_request
+  USERS ||--o{ VACANCY_REQUESTS : reviews
+  VACANCIES o|--o{ VACANCY_REQUESTS : results_in
+  VACANCIES ||--|{ RECRUITMENT_STAGES : configures
+  CANDIDATES ||--o{ APPLICATIONS : applies
+  VACANCIES ||--o{ APPLICATIONS : receives
+  RECRUITMENT_STAGES o|--o{ APPLICATIONS : current_stage
+  RECRUITMENT_STAGES ||--o{ STAGE_APPROVERS : assigns
+  USERS ||--o{ STAGE_APPROVERS : approves_stage
+  APPLICATIONS ||--o{ STAGE_TRANSITIONS : records
+  RECRUITMENT_STAGES o|--o{ STAGE_TRANSITIONS : from_stage
+  RECRUITMENT_STAGES o|--o{ STAGE_TRANSITIONS : to_stage
+  USERS ||--o{ STAGE_TRANSITIONS : moves
+  APPLICATIONS ||--o{ APPROVAL_RECORDS : requests
+  RECRUITMENT_STAGES ||--o{ APPROVAL_RECORDS : requires
+  USERS ||--o{ APPROVAL_RECORDS : decides
+  CLOSURE_REASONS o|--o{ APPLICATIONS : closes_with
+  APPLICATIONS ||--o{ CANDIDATE_NOTES : has
+  USERS ||--o{ CANDIDATE_NOTES : writes
+  APPLICATIONS ||--o{ CANDIDATE_ACTIVITIES : schedules
+  USERS ||--o{ NOTIFICATIONS : receives
+  USERS o|--o{ AUDIT_LOGS : acts
+```
+
+## Autenticação e autorização
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor Pessoa
+  participant Cliente as Web ou mobile
+  participant Google
+  participant API
+  participant DB as PostgreSQL
+
+  Pessoa->>Cliente: Inicia login
+  Cliente->>Google: Solicita autenticação
+  Google-->>Cliente: ID token
+  Cliente->>API: POST /auth/google (credential)
+  API->>Google: Obtém chaves públicas de assinatura
+  API->>API: Valida RS256, emissor, expiração, audiência e email_verified
+  API->>DB: Localiza/cria usuário pelo Google sub
+  API->>API: Aplica papel ADMIN ao e-mail inicial configurado
+  API-->>Cliente: Token de sessão assinado, válido por 8 horas
+  Cliente->>API: Requisição com Authorization: Bearer
+  API->>DB: Confere usuário ativo e escopo da vaga
+  API-->>Cliente: JSON autorizado ou erro 401/403/404
+```
+
+O administrador inicial é definido em `INITIAL_ADMIN_EMAIL`. Os demais usuários autenticados começam com papel limitado e o administrador gerencia papéis e vínculos. As regras de acesso são verificadas na API: administrador global; gestor para suas vagas e as do supervisor configurado; recrutador para vagas atribuídas; aprovador para vagas onde foi designado. O token de sessão é enviado como Bearer; a aplicação não usa cookie HttpOnly atualmente.
+
+## Fluxos de negócio
+
+### Solicitação e aprovação de abertura
+
+```mermaid
+flowchart TD
+  Start[Administrador ou gestor registra cargo, tipo, descrição, requisitos e nível]
+  Validate{Gestor ativo e recrutador vinculado?}
+  Pending[Solicitação PENDING_RECRUITER atribuída]
+  Review[Recrutador analisa a solicitação]
+  Decision{Decisão}
+  Return[Devolve com observações]
+  Adjust[Gestor ajusta e reenvia]
+  Create[API cria a vaga e etapas padrão em transação]
+  Pipeline[Vaga aparece no pipeline]
+
+  Start --> Validate
+  Validate -- Não --> Fix[Administrador configura vínculos]
+  Fix --> Start
+  Validate -- Sim --> Pending
+  Pending --> Review --> Decision
+  Decision -- Devolver --> Return --> Adjust --> Pending
+  Decision -- Aprovar --> Create --> Pipeline
+```
+
+O gestor configura o supervisor e o recrutador padrão na administração. A aprovação cria a vaga e suas etapas padrão; uma solicitação devolvida pode ser ajustada e submetida novamente.
+
+### Movimentação no pipeline
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor Recrutador
+  participant Web as Kanban web
+  participant API
+  participant DB as PostgreSQL
+
+  Recrutador->>Web: Arrasta candidatura para uma etapa
+  Web->>API: POST /applications/:id/move
+  API->>DB: Confere papel, acesso, etapa e aprovações obrigatórias
+  alt Transição válida
+    API->>DB: Atualiza candidatura e fecha/abre intervalo da etapa
+    API->>DB: Registra StageTransition e auditoria
+    API-->>Web: Candidatura atualizada
+    Web->>API: Atualiza candidatura e estatísticas da vaga
+  else Regra não atendida
+    API-->>Web: Erro de validação; mantém etapa atual
+  end
+```
+
+## Indicadores
+
+O endpoint `GET /dashboard/summary` aplica o escopo de acesso e aceita `vacancyId` para detalhar uma vaga. Os contadores de pipeline incluem somente candidaturas `ACTIVE`; contratações, reprovações e desistências são contabilizadas separadamente. O tempo médio até contratação considera candidaturas `HIRED` com datas de inscrição e encerramento. A conversão exibida na tela da vaga usa contratações divididas por todas as candidaturas retornadas para essa vaga.
+
+## Estrutura e execução
 
 ```text
 apps/
-  api/                 # REST TypeScript, módulos de domínio e OpenAPI
-  web/                 # React + TypeScript
-  mobile/              # React Native CLI atual
-packages/
-  contracts/           # Tipos e schemas de API compartilhados
-  domain/              # Regras puras compartilhadas quando fizer sentido
-  config/              # Configuração TypeScript/lint
-prisma/
-  schema.prisma
-  migrations/
-  seed.ts
-docs/
+  api/
+    src/server.mjs          # API REST e autorização
+    migrations/             # migrations PostgreSQL 001–007
+    scripts/                # migração e seed de demonstração
+  web/
+    src/App.tsx             # interface React/TypeScript
+    Dockerfile
+    nginx.conf
+App.tsx                      # interface React Native
+src/api.ts                   # cliente REST do mobile
+docker-compose.yml
+prisma/schema.prisma         # modelo de referência, não aplicado pelo Compose
+docs/architecture.md
 ```
 
-## Fases
+Para subir a aplicação, configure `.env` usando `.env.example` e execute:
 
-1. Fundação: workspaces, PostgreSQL, migrations, login Google, bootstrap admin, RBAC, departamentos e vagas.
-2. Processo seletivo: etapas/aprovadores configuráveis, candidatos, candidaturas, Kanban/lista, histórico, duração e encerramentos.
-3. Gestão: notas, atividades, fila de aprovações, notificações, dashboard e detalhamento dos indicadores.
-4. Qualidade e publicação: testes dos fluxos, acessibilidade, responsividade, segurança, documentação e implantação.
+```sh
+docker compose up --build -d
+```
 
-## Configuração necessária
+O Compose inicia PostgreSQL, aplica migrations e sobe API e painel. O seed de demonstração é opcional via perfil `demo`. O mobile é compilado e executado no host/dispositivo, consumindo a API exposta na porta configurada.
 
-Copie `.env.example` para `.env` na API e configure banco, client IDs OAuth autorizados, e-mail exato do administrador inicial e segredo de sessão. As credenciais OAuth devem ser configuradas nos consoles Google para os identificadores de cada plataforma; não devem ser commitadas.
+## Limites conhecidos
+
+- A API está implementada em JavaScript (ES modules) com validação explícita e consultas SQL via `pg`; TypeScript é usado no frontend web/mobile.
+- As migrations SQL são o schema ativo; o modelo Prisma é documentação de referência e pode divergir.
+- O contrato REST ainda não está centralizado em pacote compartilhado entre web e mobile.
+- O login mobile usa o fluxo nativo do Google; os IDs OAuth precisam ser configurados por plataforma.
+- Armazenamento privado de currículo, envio externo de notificações, retenção/eliminação automatizada LGPD e testes ponta a ponta permanecem como trabalho de evolução antes de produção.

@@ -1,64 +1,77 @@
-# API — fase de fundação
+# API — referência de execução
 
-API HTTP em Node.js 22+, PostgreSQL e `pg`. Endpoints implementados nesta fatia:
+API HTTP em Node.js 22+, PostgreSQL e `pg`. O servidor está em `src/server.mjs`; as migrations SQL em `migrations/` definem o schema ativo. A visão de implantação, modelo relacional e fluxos Mermaid estão em [docs/architecture.md](../../docs/architecture.md).
 
-| Método | Rota | Acesso |
-|---|---|---|
-| `GET` | `/health` | público; confere conexão ao banco |
-| `POST` | `/auth/google` | público; troca token Google verificado por sessão da API |
-| `GET` | `/auth/me` | usuário autenticado |
-| `GET` | `/users` | ADMIN |
-| `PATCH` | `/users/:id/role` | ADMIN; atribui HIRING_MANAGER, RECRUITER ou APPROVER e ativa/desativa |
-| `GET` | `/approvers` | Usuário autenticado; lista nomes de aprovadores ativos para configurar etapas |
-| `GET` | `/departments` | ADMIN |
-| `POST` | `/departments` | ADMIN |
-| `GET` | `/vacancies` | ADMIN vê todas; gestor/recrutador vê vagas atribuídas |
-| `POST` | `/vacancies` | ADMIN ou HIRING_MANAGER |
-| `PATCH` | `/vacancies/:id` | ADMIN ou HIRING_MANAGER; altera status, prioridade e prazo |
-| `GET` | `/vacancies/:id/stages` | Usuário com escopo na vaga |
-| `POST` | `/vacancies/:id/stages` | ADMIN ou HIRING_MANAGER |
-| `PATCH` / `DELETE` | `/stages/:id` | ADMIN ou HIRING_MANAGER; desativar preserva o histórico |
-| `PUT` | `/vacancies/:id/stages/reorder` | ADMIN ou HIRING_MANAGER |
-| `POST` | `/candidates` | ADMIN, HIRING_MANAGER ou RECRUITER |
-| `GET` | `/candidates?q=` | Candidatos das vagas autorizadas |
-| `POST` | `/applications` | ADMIN, HIRING_MANAGER ou RECRUITER |
-| `GET` | `/vacancies/:id/applications` | Usuário com escopo na vaga |
-| `POST` | `/applications/:id/move` | Gestor/recrutador autorizado; valida aprovações e transições |
-| `GET` | `/approvals` | Aprovador autenticado |
-| `POST` | `/approvals/:id/decision` | Aprovador responsável |
-| `GET` | `/closure-reasons?kind=REJECTION\|WITHDRAWAL` | Usuário autenticado |
-| `POST` | `/applications/:id/close` | Gestor/recrutador autorizado; exige motivo |
-| `POST` | `/applications/:id/hire` | ADMIN ou HIRING_MANAGER |
-| `GET` / `POST` | `/applications/:id/notes` | Usuário autorizado; nota confidencial restrita |
-| `GET` | `/applications/:id/timeline` | Histórico de etapas, aprovações, notas e atividades, com notas confidenciais filtradas |
-| `GET` / `POST` | `/applications/:id/activities` | Usuário com escopo na vaga |
-| `GET` | `/dashboard/summary` | Métricas limitadas ao escopo do usuário |
+## Autenticação e autorização
 
-As rotas protegidas usam `Authorization: Bearer <token>`. A sessão expira em oito horas e cada requisição confere se o usuário continua ativo. O único caminho para conceder ADMIN é o e-mail verificado configurado em `INITIAL_ADMIN_EMAIL`; o endpoint de gestão de usuários não permite atribuir ADMIN.
+As rotas protegidas recebem `Authorization: Bearer <token>`. O login Google verifica assinatura RS256, emissor, expiração, audiência em `GOOGLE_CLIENT_IDS` e `email_verified`. A API identifica a pessoa pelo `sub` do Google e retorna um token de sessão HMAC com validade de oito horas. A cada requisição, confere se a conta continua ativa.
 
-## Execução local
+`INITIAL_ADMIN_EMAIL` define o único administrador inicial. O endpoint de gestão de usuários não permite atribuir ADMIN. Os demais perfis são `HIRING_MANAGER`, `RECRUITER` e `APPROVER`; as ações também verificam o escopo da vaga. `POST /auth/demo` só está disponível se `ENABLE_DEMO_AUTH=true` e `NODE_ENV=development`.
 
-Na raiz do repositório:
+## Rotas principais
+
+| Método | Rota | Acesso e propósito |
+| --- | --- | --- |
+| `GET` | `/health` | Público; verifica conexão com o banco. |
+| `POST` | `/auth/google` | Público; troca credencial Google validada por sessão. |
+| `POST` | `/auth/demo` | Apenas desenvolvimento, quando explicitamente habilitado. |
+| `GET` | `/auth/me` | Sessão autenticada. |
+| `GET` | `/users` | ADMIN; lista usuários e vínculos organizacionais. |
+| `PATCH` | `/users/:id/role` | ADMIN; altera papel permitido e ativa/desativa usuário. |
+| `PATCH` | `/users/:id/relationships` | ADMIN; define supervisor e recrutador padrão do gestor. |
+| `GET`, `POST` | `/departments` | ADMIN; lista/cria departamentos. |
+| `GET` | `/vacancy-requests` | ADMIN, gestor ou recrutador; lista conforme escopo. |
+| `POST` | `/vacancy-requests` | ADMIN/gestor; solicita abertura de cargo para análise. |
+| `PATCH` | `/vacancy-requests/:id/resubmit` | ADMIN/gestor com acesso; reenvia solicitação devolvida. |
+| `POST` | `/vacancy-requests/:id/review` | Recrutador atribuído; aprova ou devolve com observações. |
+| `GET` | `/vacancies` | Vagas dentro do escopo do papel. |
+| `POST` | `/vacancies` | Retorna `409`; novas vagas devem passar por `/vacancy-requests`. |
+| `PATCH` | `/vacancies/:id` | ADMIN/gestor autorizado; atualiza status, prioridade e prazo. |
+| `GET`, `POST` | `/vacancies/:id/stages` | Consulta/configura etapas da vaga autorizada. |
+| `PATCH`, `DELETE` | `/stages/:id` | ADMIN/gestor; altera ou desativa etapa preservando histórico. |
+| `PUT` | `/vacancies/:id/stages/reorder` | ADMIN/gestor; reordena etapas. |
+| `POST`, `GET` | `/candidates` | Cadastro e busca limitados às permissões do usuário. |
+| `POST` | `/applications` | Cria candidatura associada à vaga. |
+| `GET` | `/vacancies/:id/applications` | Lista candidaturas da vaga autorizada. |
+| `POST` | `/applications/:id/move` | Gestor/recrutador autorizado; valida transição e aprovações. |
+| `GET` | `/approvals` | Lista decisões destinadas ao usuário autenticado. |
+| `POST` | `/approvals/:id/decision` | Aprovador designado; aprova, reprova ou solicita informação. |
+| `GET` | `/notifications` | Lista notificações do usuário. |
+| `PATCH` | `/notifications/:id/read` | Marca notificação do usuário como lida. |
+| `GET` | `/closure-reasons?kind=REJECTION\|WITHDRAWAL` | Lista motivos ativos de encerramento. |
+| `POST` | `/applications/:id/close` | Gestor/recrutador autorizado; encerra com motivo obrigatório. |
+| `POST` | `/applications/:id/hire` | ADMIN/gestor autorizado; registra contratação. |
+| `GET`, `POST` | `/applications/:id/notes` | Lê/cria observações; conteúdo confidencial é filtrado por permissão. |
+| `GET` | `/applications/:id/timeline` | Histórico de transições, decisões e observações visíveis. |
+| `GET`, `POST` | `/applications/:id/activities` | Lista/cria atividades da candidatura autorizada. |
+| `POST` | `/activities/:id/complete` | Conclui atividade acessível ao usuário. |
+| `GET` | `/dashboard/summary` | Métricas no escopo do usuário; aceita `vacancyId` para detalhar uma vaga. |
+
+## Modelo e transações
+
+`applications` representa uma candidatura independente para cada par candidato/vaga. As movimentações atualizam a etapa atual, encerram o intervalo anterior, criam `stage_transitions`, registram aprovações necessárias e gravam auditoria no fluxo transacional. Encerramentos separam contratação, reprovação e desistência. O banco possui índice único para impedir mais de uma candidatura da mesma pessoa à mesma vaga.
+
+Migrations SQL numeradas de `001` a `007` são aplicadas pelo runner em `scripts/migrate.mjs`. O Compose aguarda o PostgreSQL saudável e a conclusão do serviço `migrate` antes de iniciar a API.
+
+## Execução
+
+Na raiz do repositório, configure `.env` a partir de `.env.example` e execute:
+
+```sh
+docker compose up --build -d
+```
+
+Para execução local da API fora do Compose:
 
 ```sh
 npm install
 docker compose up -d postgres
-cp apps/api/.env.example apps/api/.env
+npm run db:migrate
+npm run api
 ```
 
-No arquivo `apps/api/.env`, configure `GOOGLE_CLIENT_IDS`, `INITIAL_ADMIN_EMAIL` e um `SESSION_SECRET` aleatório com pelo menos 32 caracteres. Configure `WEB_ORIGIN` para a origem exata do frontend web. Em seguida:
+Configure `DATABASE_URL`, `GOOGLE_CLIENT_IDS`, `INITIAL_ADMIN_EMAIL` e um `SESSION_SECRET` aleatório de pelo menos 32 caracteres. `DATABASE_SSL=true` habilita TLS com validação de certificado. Consulte o README da raiz para URLs autorizadas no Google Cloud Console.
 
-```sh
-npm run migrate
-npm run start:dev
-```
+## Limites conhecidos
 
-`DATABASE_SSL=true` habilita TLS com validação do certificado para bancos remotos. Em produção, use segredo próprio, credenciais de banco restritas, HTTPS e armazenamento de documentos privado.
-
-## Login Google
-
-O cliente obtém um Google ID token por meio do fluxo OAuth da plataforma e envia `POST /auth/google` com `{ "credential": "..." }`. O servidor valida assinatura RS256 com chaves públicas do Google, emissor, expiração, `email_verified` e audiência (`GOOGLE_CLIENT_IDS`). O token de identidade não é usado como sessão da aplicação.
-
-## Limites desta entrega
-
-Esta API cobre autenticação, usuários/perfis, departamentos e vagas. A interface React Native ainda não foi conectada a ela; etapas, candidatos, candidaturas, Kanban, aprovações, dashboard e notificações ficam para as fases seguintes. O schema Prisma em `../../prisma/schema.prisma` é o modelo alvo; a migration SQL desta pasta cobre somente a fundação executável atual.
+O schema aplicado é definido pelas migrations SQL; `prisma/schema.prisma` é uma referência e pode divergir. A API usa JavaScript ES modules e validação explícita. Os tipos REST ainda não são distribuídos por um pacote compartilhado, e armazenamento privado de currículos, entregas externas de notificações, políticas LGPD automatizadas e testes ponta a ponta precisam de evolução antes do uso em produção.

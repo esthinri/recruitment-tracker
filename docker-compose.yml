@@ -2,18 +2,84 @@ services:
   postgres:
     image: postgres:17-alpine
     environment:
-      POSTGRES_DB: recruitment_tracker
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ${POSTGRES_DB:?Configure POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Configure POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Configure POSTGRES_PASSWORD in .env}
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - recruitment_tracker_db:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d recruitment_tracker"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
+      retries: 15
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    command: ["node", "scripts/migrate.mjs"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?Configure DATABASE_URL in .env}
+      DATABASE_SSL: ${DATABASE_SSL:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL:?Configure DATABASE_URL in .env}
+      DATABASE_SSL: ${DATABASE_SSL:-false}
+      GOOGLE_CLIENT_IDS: ${GOOGLE_CLIENT_ID:?Set GOOGLE_CLIENT_ID in .env}${GOOGLE_EXTRA_CLIENT_IDS:+,${GOOGLE_EXTRA_CLIENT_IDS}}
+      INITIAL_ADMIN_EMAIL: ${INITIAL_ADMIN_EMAIL:?Set INITIAL_ADMIN_EMAIL in .env}
+      SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET in .env}
+      WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:8080}
+      PORT: 4000
+      ENABLE_DEMO_AUTH: "false"
+    ports:
+      - "${API_PORT:-4000}:4000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
       retries: 10
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        VITE_API_URL: /api
+        VITE_GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  seed-demo:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    command: ["node", "scripts/seed-demo.mjs"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?Configure DATABASE_URL in .env}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    profiles: ["demo"]
 
 volumes:
   recruitment_tracker_db:
