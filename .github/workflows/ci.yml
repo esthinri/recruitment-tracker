@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main, projeto-inicial]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate application
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check API JavaScript syntax
+        run: |
+          node --check apps/api/src/server.mjs
+          node --check apps/api/scripts/migrate.mjs
+          node --check apps/api/scripts/seed-demo.mjs
+
+      - name: Build web application
+        run: npm run build --workspace @recruitment-tracker/web
+
+      - name: Validate Docker Compose configuration
+        env:
+          POSTGRES_DB: recruitment_ci
+          POSTGRES_USER: recruitment_ci
+          POSTGRES_PASSWORD: ci-only-password
+          DATABASE_URL: postgres://recruitment_ci:ci-only-password@postgres:5432/recruitment_ci
+          GOOGLE_CLIENT_ID: ci-only.apps.googleusercontent.com
+          INITIAL_ADMIN_EMAIL: admin@example.test
+          SESSION_SECRET: ci-only-session-secret-at-least-32-characters
+          WEB_ORIGIN: http://localhost:8080
+        run: docker compose config --quiet

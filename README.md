@@ -26,6 +26,10 @@ As telas abaixo são capturas reais do painel web conectado à API e ao PostgreS
 - Dashboard com vagas, candidaturas ativas, contratações, aprovações e atrasos.
 - Aplicativo Android/iOS conectado à mesma API.
 
+## Integração contínua
+
+O [GitHub Actions](.github/workflows/ci.yml) roda em pushes para `main` e `projeto-inicial`, pull requests para `main` e também pode ser iniciado manualmente. O pipeline instala as dependências, verifica a sintaxe dos scripts da API, compila o painel web e valida a configuração do Docker Compose. A validação do Compose usa valores fictícios de CI e não requer credenciais reais.
+
 ## Arquitetura e modelo de dados
 
 Os diagramas Mermaid de implantação, modelo relacional, autenticação e fluxos principais, além dos limites da arquitetura atual, estão em [docs/architecture.md](docs/architecture.md). As migrations PostgreSQL executáveis estão em `apps/api/migrations`; `prisma/schema.prisma` é um modelo de referência e não é aplicado pelo Compose.
